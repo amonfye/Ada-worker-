@@ -1,4 +1,4 @@
- python:3.11-slim
+FROM python:3.11-slim
 
 # ffmpeg = lecture des M4A / libsndfile = lecture WAV, FLAC, MP3
 RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg libsndfile1 \
