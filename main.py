@@ -448,3 +448,9 @@ def master(file: UploadFile = File(...),
         shutil.rmtree(tmp, ignore_errors=True)
         log.exception("Erreur de mastering")
         raise HTTPException(500, "Erreur inattendue pendant le mastering.")
+
+
+# Lancement direct : lit le port donné par l'hébergeur (variable PORT), sans shell
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", "8000")))
