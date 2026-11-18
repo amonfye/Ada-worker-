@@ -2,8 +2,9 @@
 Ada Hightec - worker de mastering audio (FastAPI)
 
 POST /master : reçoit un fichier audio, renvoie un WAV 16 bits masterisé.
-Pas de presets : le morceau est analysé, puis chaque réglage (EQ, compression,
-stéréo, gain) est décidé d'après les mesures.
+Le style (trap, rap, afro, pop) est détecté à partir des mesures audio, puis
+chaque réglage (EQ, compression, stéréo, gain) est décidé d'après le style
+et les mesures du morceau. Le style peut aussi être imposé (paramètre style).
 
 Bibliothèques : numpy, scipy, librosa, pyloudnorm, soundfile (aucune licence GPL).
 Tous les réglages modifiables sont dans le dictionnaire CFG juste en dessous.
@@ -167,6 +168,164 @@ def analyse(x, sr, meter):
 
 
 # ----------------------------------------------------------------------------
+# DÉTECTION DU STYLE (trap / rap / afro / pop) + profils de traitement
+# ----------------------------------------------------------------------------
+# Détection par mesures audio (tempo, 808/sub, charleys, syncope, brillance),
+# sans modèle entraîné : chaque style reçoit un score, le plus haut l'emporte.
+# Si l'écart entre les deux premiers est trop faible -> "autre" (courbe neutre).
+# Les seuils et courbes sont des points de départ : à caler avec de vrais morceaux
+# étiquetés (voir STYLE_CFG) et à l'oreille.
+STYLE_CFG = {
+    "min_margin": 0.06,        # écart relatif minimal entre 1er et 2e score
+    "analysis_seconds": 45,    # durée analysée (milieu du morceau)
+}
+
+# Courbe cible par style (même format que CFG["eq_target"]) + réglages dynamiques.
+# low_ratio_cap : ratio max sur la bande grave ; attack_scale : >1 = attaques plus
+# lentes (on garde plus de transitoires) ; bass_mono_hz : coupure mono des basses.
+STYLE_PROFILES = {
+    "trap": {"label": "Trap",
+             "eq_target": {"sub": 4.0, "bass": 6.0, "lowmid": 2.0, "mid": 0.0,
+                           "presence": -4.0, "air": -10.0},
+             "low_ratio_cap": 1.8, "attack_scale": 1.0, "bass_mono_hz": 140},
+    "rap": {"label": "Rap",
+            "eq_target": {"sub": 2.5, "bass": 5.5, "lowmid": 3.0, "mid": 0.0,
+                          "presence": -3.0, "air": -11.0},
+            "low_ratio_cap": 2.0, "attack_scale": 1.0, "bass_mono_hz": 120},
+    "afro": {"label": "Afro",
+             "eq_target": {"sub": 1.5, "bass": 4.5, "lowmid": 2.5, "mid": 0.0,
+                           "presence": -3.5, "air": -10.5},
+             "low_ratio_cap": 1.6, "attack_scale": 1.6, "bass_mono_hz": 110},
+    "pop": {"label": "Pop",
+            "eq_target": {"sub": 0.5, "bass": 3.5, "lowmid": 2.0, "mid": 0.0,
+                          "presence": -3.0, "air": -9.0},
+            "low_ratio_cap": 2.0, "attack_scale": 1.2, "bass_mono_hz": 120},
+    "autre": {"label": "Autre",
+              "eq_target": dict(CFG["eq_target"]),
+              "low_ratio_cap": 2.0, "attack_scale": 1.0, "bass_mono_hz": CFG["bass_mono_hz"]},
+}
+STYLE_CHOICES = ("auto",) + tuple(STYLE_PROFILES)
+
+
+def _band_flux(mag, freqs, lo, hi):
+    m = (freqs >= lo) & (freqs < hi)
+    b = np.log1p(1000 * mag[m])
+    return np.maximum(np.diff(b, axis=1), 0).sum(axis=0)
+
+
+def _peaks(env, fps, min_gap_s=0.05):
+    """Instants (en trames) des pics d'une enveloppe d'attaques."""
+    if env.size < 3 or env.std() == 0:
+        return np.array([], dtype=int)
+    thr = np.median(env) + 1.5 * env.std()
+    dist = max(1, int(min_gap_s * fps))
+    idx, _ = signal.find_peaks(env, height=thr, distance=dist)
+    return idx
+
+
+def _tempo(env, fps):
+    """Tempo (BPM) entre 85 et 170 : autocorrélation de l'enveloppe d'attaques,
+    renforcée par ses multiples (peigne) et pondérée vers ~110 BPM."""
+    e = env - env.mean()
+    if e.std() == 0 or len(e) < fps * 8:
+        return 0.0
+    ac = np.correlate(e, e, mode="full")[len(e) - 1:]
+    ac = ac / (ac[0] + 1e-12)
+    best, best_s = 0.0, -np.inf
+    for bpm in np.arange(85.0, 170.5, 0.5):
+        lag = 60.0 * fps / bpm
+        sc = 0.0
+        for m, wgt in ((1, 1.0), (2, 0.5), (4, 0.25), (0.5, 0.25)):
+            L = lag * m
+            if L >= len(ac) - 1:
+                continue
+            i = int(L); fr_ = L - i
+            sc += wgt * (ac[i] * (1 - fr_) + ac[i + 1] * fr_)
+        sc *= np.exp(-0.5 * (np.log2(bpm / 110.0) / 0.9) ** 2)
+        if sc > best_s:
+            best, best_s = bpm, sc
+    return float(best)
+
+
+def _in(v, lo, hi, soft=6.0):
+    """1 dans [lo, hi], décroît doucement à l'extérieur."""
+    if lo <= v <= hi:
+        return 1.0
+    d = lo - v if v < lo else v - hi
+    return float(max(0.0, 1 - d / soft))
+
+
+def detect_style(x, sr, rel):
+    mono = x.mean(axis=1)
+    win = int(STYLE_CFG["analysis_seconds"] * sr)
+    if len(mono) > win:
+        s = (len(mono) - win) // 2
+        mono = mono[s:s + win]
+    hop, n_fft = 512, 2048
+    mag = np.abs(librosa.stft(mono, n_fft=n_fft, hop_length=hop))
+    freqs = librosa.fft_frequencies(sr=sr, n_fft=n_fft)
+    fps = sr / hop
+    dur = len(mono) / sr
+
+    # Tempo sur les attaques graves/médiums (kick, snare) : les charleys le faussent
+    rhythm = _band_flux(mag, freqs, 30, 200) + 0.5 * _band_flux(mag, freqs, 200, 2000)
+    bpm = _tempo(rhythm, fps)
+
+    # Charleys : attaques dans l'aigu par seconde (roulements trap = beaucoup)
+    hat_rate = len(_peaks(_band_flux(mag, freqs, 6000, 16000), fps, 0.04)) / dur
+    # 808 : part du temps où le sub (30-60 Hz) reste proche de son maximum
+    sub_m = (freqs >= 30) & (freqs < 60)
+    sub_db = 20 * np.log10(mag[sub_m].mean(axis=0) + 1e-9)
+    sub_sustain = float((sub_db > np.percentile(sub_db, 95) - 10).mean())
+    # Syncope : part des attaques graves/médiums hors des temps
+    perc = _peaks(_band_flux(mag, freqs, 60, 2000), fps, 0.06)
+    sync = 0.0
+    if bpm > 0 and len(perc) > 8:
+        beat = 60.0 * fps / bpm
+        ph = (perc % beat) / beat
+        # phase de grille qui aligne le plus d'attaques sur le temps
+        best = max(np.linspace(0, 1, 32, endpoint=False),
+                   key=lambda p: np.sum(np.minimum(np.abs(ph - p), 1 - np.abs(ph - p)) < 0.08))
+        dist = np.minimum(np.abs(ph - best), 1 - np.abs(ph - best))
+        on_beat = dist < 0.08
+        on_half = np.abs(dist - 0.5) < 0.08
+        sync = float(1 - (on_beat | on_half).mean())
+    # Brillance : présence + air par rapport au médium
+    bright = float(rel.get("presence", -4) + 0.5 * rel.get("air", -11))
+    sub_rel = float(rel.get("sub", 0))
+
+    f = {
+        "hat": float(np.clip((hat_rate - 3) / 7, 0, 1)),
+        "sub": float(np.clip((sub_rel + 2) / 8, 0, 1)),
+        "sustain": float(np.clip((sub_sustain - 0.15) / 0.45, 0, 1)),
+        "sync": float(np.clip((sync - 0.2) / 0.4, 0, 1)),
+        "bright": float(np.clip((bright + 12) / 10, 0, 1)),
+    }
+    scores = {
+        # trap : charleys serrés + 808 longues, sur une grille plutôt droite
+        "trap": (1.2 * f["hat"] + 1.0 * f["sustain"] + 0.8 * f["sub"] + 0.7 * _in(bpm, 128, 170, 10))
+                * (1 - 0.35 * f["sync"]),
+        "rap": 0.9 * f["sub"] + 0.5 * f["sustain"] + 0.8 * _in(bpm, 85, 105) + 0.4 * (1 - f["hat"])
+               + 0.3 * (1 - f["sync"]),
+        "afro": 1.3 * f["sync"] + 0.9 * _in(bpm, 95, 120) + 0.4 * (1 - f["sustain"]) + 0.3 * (1 - f["hat"]),
+        "pop": 0.9 * f["bright"] + 0.6 * _in(bpm, 95, 132) + 0.6 * (1 - f["sub"]) + 0.4 * (1 - f["sync"])
+               + 0.3 * (1 - f["sustain"]),
+    }
+    ranked = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
+    (s1, v1), (_, v2) = ranked[0], ranked[1]
+    margin = (v1 - v2) / max(v1, 1e-9)
+    style = s1 if margin >= STYLE_CFG["min_margin"] else "autre"
+    return {
+        "style": style,
+        "confidence": round(float(np.clip(margin / 0.3, 0, 1)), 2),
+        "scores": {k: round(v, 2) for k, v in scores.items()},
+        "features": {"bpm": round(bpm, 1), "hat_rate_per_s": round(hat_rate, 1),
+                     "sub_sustain": round(sub_sustain, 2), "syncopation": round(sync, 2),
+                     "sub_rel_db": round(sub_rel, 1), "brightness": round(bright, 1)},
+    }
+
+
+# ----------------------------------------------------------------------------
 # EQ CORRECTIF (filtres biquad RBJ)
 # ----------------------------------------------------------------------------
 def _peaking(f0, gain_db, q, sr):
@@ -194,9 +353,9 @@ def _high_shelf(f0, gain_db, sr):
     return np.array(b + a) / a[0]
 
 
-def apply_eq(x, sr, rel, strength):
+def apply_eq(x, sr, rel, strength, eq_target=None):
     rows, gains = [], {}
-    for name, target in CFG["eq_target"].items():
+    for name, target in (eq_target or CFG["eq_target"]).items():
         if name == "mid" or name not in rel or name not in EQ_FILTERS:
             continue
         f0, kind, q = EQ_FILTERS[name]
@@ -270,16 +429,16 @@ def compress_band(b, sr, ratio, thr_percentile, att_ms, rel_ms):
     return b * gain[:, None], float(gr.max())
 
 
-def multiband(x, sr, dyn, intensity):
+def multiband(x, sr, dyn, intensity, low_ratio_cap=2.0, attack_scale=1.0):
     if dyn < 6:
         return x, {}, "Morceau déjà très compressé : compression sautée."
     base = 2.2 if dyn > 14 else 1.8 if dyn > 9 else 1.4
     ratio = 1 + (base - 1) * intensity
     low, mid, high = split_bands(x, sr)
     # (bande, ratio, seuil en percentile, attaque ms, release ms)
-    plan = [("low", min(ratio, 2.0), 75, 30, 200),
-            ("mid", ratio, 70, 15, 120),
-            ("high", ratio, 70, 5, 80)]
+    plan = [("low", min(ratio, low_ratio_cap), 75, 30 * attack_scale, 200),
+            ("mid", ratio, 70, 15 * attack_scale, 120),
+            ("high", ratio, 70, 5 * attack_scale, 80)]
     out, stats = 0, {}
     for (name, r, pct, att, rel), band in zip(plan, (low, mid, high)):
         band, max_gr = compress_band(band, sr, r, pct, att, rel)
@@ -291,10 +450,10 @@ def multiband(x, sr, dyn, intensity):
 # ----------------------------------------------------------------------------
 # STÉRÉO : basses en mono, largeur ajustée
 # ----------------------------------------------------------------------------
-def stereo_process(x, sr, width):
+def stereo_process(x, sr, width, mono_hz=None):
     L, R = x[:, 0], x[:, 1]
     M, S = (L + R) / 2, (L - R) / 2
-    lp = signal.butter(2, CFG["bass_mono_hz"], "low", fs=sr, output="sos")
+    lp = signal.butter(2, mono_hz or CFG["bass_mono_hz"], "low", fs=sr, output="sos")
     S = (S - signal.sosfiltfilt(lp, S)) * width
     return np.stack([M + S, M - S], axis=1)
 
@@ -342,10 +501,13 @@ def write_wav16(path, y, sr):
 # ----------------------------------------------------------------------------
 # CHAÎNE COMPLÈTE
 # ----------------------------------------------------------------------------
-def master_audio(x, sr, target_lufs, intensity):
+def master_audio(x, sr, target_lufs, intensity, style="auto"):
     meter = pyln.Meter(sr)
     a = analyse(x, sr, meter)
     warnings = []
+    det = detect_style(x, sr, a["rel"])
+    chosen = det["style"] if style == "auto" else style
+    prof = STYLE_PROFILES[chosen]
     if a["clip_ratio"] > CFG["max_clip_ratio"]:
         raise AudioError("Le fichier est déjà saturé (clipping) à la source. "
                          "Réexporte ton mix avec plus de marge (pics sous -1 dB).")
@@ -354,11 +516,12 @@ def master_audio(x, sr, target_lufs, intensity):
     if a["corr"] < 0.0:
         warnings.append("Problème de phase stéréo détecté : image resserrée.")
 
-    y, eq_gains = apply_eq(x, sr, a["rel"], intensity)
-    y, comp, comp_warn = multiband(y, sr, a["dyn"], intensity)
+    y, eq_gains = apply_eq(x, sr, a["rel"], intensity, prof["eq_target"])
+    y, comp, comp_warn = multiband(y, sr, a["dyn"], intensity,
+                                   prof["low_ratio_cap"], prof["attack_scale"])
     if comp_warn:
         warnings.append(comp_warn)
-    y = stereo_process(y, sr, a["width"])
+    y = stereo_process(y, sr, a["width"], prof["bass_mono_hz"])
 
     # Gain vers la cible LUFS, avec correction après limitation (jusqu'à 4 passes)
     lufs = meter.integrated_loudness(y)
@@ -386,6 +549,9 @@ def master_audio(x, sr, target_lufs, intensity):
         out_lufs = float(meter.integrated_loudness(out))
 
     report = {
+        "style": chosen, "style_label": prof["label"],
+        "style_source": "auto" if style == "auto" else "choisi",
+        "style_detection": det,
         "lufs_in": round(a["lufs"], 1), "lufs_out": round(out_lufs, 1),
         "true_peak_out_db": round(tp, 1), "limiter_max_gr_db": round(max_gr, 1),
         "dynamic_range_in_db": round(a["dyn"], 1), "eq_gains_db": eq_gains,
@@ -411,8 +577,10 @@ def health():
 @app.post("/master")
 def master(file: UploadFile = File(...),
            target_lufs: float = Form(-14.0),
-           intensity: str = Form("normal")):
-    """target_lufs : -14 (streaming) ou -9 (loud). intensity : doux | normal | fort."""
+           intensity: str = Form("normal"),
+           style: str = Form("auto")):
+    """target_lufs : -14 (streaming) ou -9 (loud). intensity : doux | normal | fort.
+    style : auto (détection) | trap | rap | afro | pop | autre."""
     ext = os.path.splitext(file.filename or "")[1].lower()
     if ext not in ALLOWED_EXT:
         raise HTTPException(415, "Format non accepté (WAV, MP3, FLAC ou M4A).")
@@ -420,6 +588,8 @@ def master(file: UploadFile = File(...),
         raise HTTPException(422, "target_lufs doit être entre -16 et -7.")
     if intensity.lower() not in INTENSITY:
         raise HTTPException(422, "intensity doit être doux, normal ou fort.")
+    if style.lower() not in STYLE_CHOICES:
+        raise HTTPException(422, "style doit être auto, trap, rap, afro, pop ou autre.")
 
     tmp = tempfile.mkdtemp(prefix="ada_")
     try:
@@ -434,7 +604,8 @@ def master(file: UploadFile = File(...),
 
         with _LOCK:
             x, sr = load_audio(src)
-            out, report = master_audio(x, sr, target_lufs, INTENSITY[intensity.lower()])
+            out, report = master_audio(x, sr, target_lufs, INTENSITY[intensity.lower()],
+                                       style.lower())
             dst = os.path.join(tmp, "master.wav")
             write_wav16(dst, out, sr)
 
